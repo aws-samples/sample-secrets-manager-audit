@@ -49,6 +49,7 @@ from secrets_audit.renderer import render
 from secrets_audit.resolver import (
     SimulationResult,
     get_resource_policy_principals,
+    inspect_context_keys,
     list_iam_roles,
     list_iam_users,
     list_secret_versions,
@@ -318,6 +319,16 @@ def main(
 
     if progress:
         progress(f"Simulation complete: {len(identity_principals)} of {len(all_principal_arns)} principals have access")
+
+    # --- Step 5c: Inspect context keys for fully-denied principals ---
+    if sim_result.fully_denied_arns and not sim_result.truncated:
+        if progress:
+            progress(f"Inspecting context keys for {len(sim_result.fully_denied_arns)} fully-denied principal(s)...")
+        flagged_warnings, inspection_warnings = inspect_context_keys(
+            prod_session, sim_result.fully_denied_arns, progress=progress
+        )
+        warnings.extend(flagged_warnings)
+        warnings.extend(inspection_warnings)
 
     # Merge: deduplicate by ARN, prefer identity_policy source
     principals_by_arn = {p.principal_arn: p for p in resource_principals}

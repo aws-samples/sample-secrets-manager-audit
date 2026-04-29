@@ -14,7 +14,7 @@ import json
 import logging
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import botocore.exceptions
@@ -76,6 +76,7 @@ class SimulationResult:
     truncated: bool = False
     evaluated_count: int = 0
     total_count: int = 0
+    fully_denied_arns: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ def simulate_principal_access(
 
     client = session.client("iam", config=RETRY_CONFIG)
     results: list[PrincipalAccess] = []
+    fully_denied: list[str] = []
 
     logger.info(
         "Simulating access for %d principals against %s",
@@ -435,6 +437,7 @@ def simulate_principal_access(
                 return SimulationResult(
                     principals=results, truncated=True,
                     evaluated_count=idx, total_count=total,
+                    fully_denied_arns=fully_denied,
                 )
             # Let adaptive retry handle throttling; re-raise others
             logger.error(
@@ -453,8 +456,37 @@ def simulate_principal_access(
         # Collect allowed actions from evaluation results
         allowed: list[str] = []
         for result in response.get("EvaluationResults", []):
+            action = result["EvalActionName"]
             if result.get("EvalDecision") == "allowed":
-                allowed.append(result["EvalActionName"])
+                allowed.append(action)
+                continue
+            # Check resource-specific results for scoped Resource policies
+            for rsr in result.get("ResourceSpecificResults", []):
+                if rsr.get("EvalResourceDecision") == "allowed":
+                    allowed.append(action)
+                    break
+
+        # Track fully-denied principals: all actions must have implicitDeny
+        # with empty MatchedStatements and no allowed ResourceSpecificResults.
+        # Do NOT classify as fully denied if any action has explicitDeny,
+        # non-empty MatchedStatements, or any allowed decision.
+        if not allowed:
+            is_fully_denied = True
+            for result in response.get("EvaluationResults", []):
+                decision = result.get("EvalDecision")
+                matched = result.get("MatchedStatements", [])
+                if decision != "implicitDeny" or matched:
+                    is_fully_denied = False
+                    break
+                # Check ResourceSpecificResults for any allowed decision
+                for rsr in result.get("ResourceSpecificResults", []):
+                    if rsr.get("EvalResourceDecision") == "allowed":
+                        is_fully_denied = False
+                        break
+                if not is_fully_denied:
+                    break
+            if is_fully_denied and response.get("EvaluationResults"):
+                fully_denied.append(principal_arn)
 
         if allowed:
             access_level = derive_access_level(allowed)
@@ -481,7 +513,127 @@ def simulate_principal_access(
     return SimulationResult(
         principals=results, truncated=False,
         evaluated_count=total, total_count=total,
+        fully_denied_arns=fully_denied,
     )
+
+
+# ---------------------------------------------------------------------------
+# Context key inspection
+# ---------------------------------------------------------------------------
+
+_RESOURCE_TAG_PREFIX = "secretsmanager:ResourceTag/"
+
+
+def inspect_context_keys(
+    session: Session,
+    principal_arns: list[str],
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Check fully-denied principals for secretsmanager:ResourceTag/ context keys.
+
+    Calls ``GetContextKeysForPrincipalPolicy`` for each principal ARN and
+    checks whether any returned key starts with ``secretsmanager:ResourceTag/``.
+    If so, a warning is emitted because the IAM Policy Simulator cannot
+    evaluate those condition keys.
+
+    **Security invariant**: this function NEVER calls ``GetSecretValue``.
+
+    Parameters
+    ----------
+    session:
+        A boto3 session for the production account.
+    principal_arns:
+        IAM principal ARNs to inspect (should be fully-denied principals).
+    progress:
+        Optional callback for progress messages.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        ``(flagged_warnings, inspection_warnings)`` where *flagged_warnings*
+        are limitation warnings for principals whose policies reference
+        ``secretsmanager:ResourceTag/`` keys, and *inspection_warnings* are
+        operational warnings (e.g. credential expiry).
+    """
+    client = session.client("iam", config=RETRY_CONFIG)
+    flagged_warnings: list[str] = []
+    inspection_warnings: list[str] = []
+
+    total = len(principal_arns)
+    logger.info("Inspecting context keys for %d fully-denied principal(s)", total)
+
+    for idx, principal_arn in enumerate(principal_arns):
+        if progress is not None and idx > 0:
+            progress(f"Inspecting context keys... ({idx}/{total})")
+
+        logger.debug(
+            "GetContextKeysForPrincipalPolicy for %s (%d/%d)",
+            principal_arn, idx + 1, total,
+        )
+
+        try:
+            response = client.get_context_keys_for_principal_policy(
+                PolicySourceArn=principal_arn,
+            )
+        except botocore.exceptions.ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code in ("AccessDeniedException", "AccessDenied"):
+                logger.warning(
+                    "Access denied on GetContextKeysForPrincipalPolicy for %s — skipping",
+                    principal_arn,
+                )
+                continue
+            if error_code == "NoSuchEntity":
+                logger.debug(
+                    "Principal %s no longer exists — skipping context key inspection",
+                    principal_arn,
+                )
+                continue
+            if is_expired_token_error(exc):
+                logger.warning(
+                    "Credentials expired during context key inspection at principal %d of %d",
+                    idx + 1, total,
+                )
+                inspection_warnings.append(
+                    "Context key inspection incomplete: credentials expired before all "
+                    "fully-denied principals could be inspected."
+                )
+                break
+            # Let adaptive retry handle throttling; re-raise others
+            logger.error(
+                "ClientError %s on GetContextKeysForPrincipalPolicy for %s: %s",
+                error_code, principal_arn, exc,
+            )
+            raise
+        except botocore.exceptions.BotoCoreError as exc:
+            logger.error(
+                "SDK error on GetContextKeysForPrincipalPolicy for %s: %s",
+                principal_arn, exc,
+            )
+            raise
+
+        context_keys: list[str] = response.get("ContextKeyNames", [])
+        has_resource_tag_key = any(
+            k.startswith(_RESOURCE_TAG_PREFIX) for k in context_keys
+        )
+
+        if has_resource_tag_key:
+            name = _principal_name_from_arn(principal_arn)
+            flagged_warnings.append(
+                f"Principal {name} has policies using secretsmanager:ResourceTag "
+                f"conditions which the IAM Policy Simulator cannot evaluate. "
+                f"This principal may have access that is not reflected in this report."
+            )
+
+        # Rate-limit: sleep between calls to stay under ~5 req/sec
+        if idx < total - 1:
+            time.sleep(_BATCH_SLEEP)
+
+    logger.info(
+        "Context key inspection complete: %d warning(s) flagged",
+        len(flagged_warnings),
+    )
+    return (flagged_warnings, inspection_warnings)
 
 
 # ---------------------------------------------------------------------------
