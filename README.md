@@ -451,36 +451,11 @@ secrets_audit/
 ├── resolver.py          # DescribeSecret, IAM Policy Simulator, resource policy parsing
 ├── validators.py        # Input validation (secret name/ARN, account ID, role ARN, region, profile name)
 └── web.py               # Streamlit web UI — browser-based audit interface (optional dependency)
-
-tests/
-├── conftest.py                # Shared fixtures
-├── test_access_level.py       # Property tests: action → access level derivation
-├── test_aws_clients.py        # Unit tests: session creation, AssumeRole, caller identity
-├── test_classifier.py         # Property tests: trust policy → classification
-├── test_cli.py                # CLI argument parsing, defaults, validation, output routing
-├── test_cloudtrail.py         # Property tests: event selection, unavailable handling
-├── test_early_cross_account_validation.py # Property + unit tests: fail-fast, --allow-partial, session reuse
-├── test_ic_region_detection.py    # Property + unit tests: IC region auto-detection, --ic-region, fallback
-├── test_ic_instance_cache.py      # Bug condition + preservation tests: IC instance single-call caching
-├── test_integration.py        # End-to-end with moto mocks (mixed principals, degradation)
-├── test_last_accessed_flag.py # Property + unit tests: --last-accessed flag opt-in, CloudTrail skip/run, renderer None handling
-├── test_master_profile.py     # Property + unit tests: --master-profile validation, session, wiring
-├── test_output_safety.py      # Property tests: no secrets/credentials in rendered output
-├── test_permission_set.py     # Property tests: role name → permission set name round-trip
-├── test_policy_parser.py      # Property tests: resource policy → Allow principals
-├── test_progress_messages.py  # Property + unit tests: --quiet flag, progress message intervals, stderr isolation
-├── test_region_flag.py        # Property + unit tests: --region flag validation, propagation, output
-├── test_renderer_structured.py # Property tests: JSON round-trip, structure preservation
-├── test_renderer_table.py     # Property tests: metadata header, columns, truncation, CSV group expansion, PDF validation
-├── test_validators.py         # Unit + property tests: input validation accept/reject
-├── test_version_metadata.py   # Property + unit tests: --versions flag, version retrieval, rendering
-├── test_pipeline.py           # Property tests: pipeline validation, metadata, progress, output safety
-├── test_web.py                # Unit + property tests: web UI launcher, download content, render idempotency
-├── test_credential_expiry.py  # Property + unit tests: credential expiry guard, partial reports, SimulationResult
-└── test_tag_policy_eval.py   # Property + unit tests: tag-based IAM policy evaluation, ContextEntries, ResourceHandlingOption
 ```
 
 ## Development
+
+> **Note:** The test suite (328 tests: unit, property-based, and integration) is maintained in a private development repository and is not included in this distribution.
 
 ```bash
 # Install with test dependencies
