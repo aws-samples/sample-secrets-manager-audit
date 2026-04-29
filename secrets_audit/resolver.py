@@ -10,6 +10,7 @@ reads metadata, policies, and simulation results.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import sys
@@ -817,3 +818,499 @@ def derive_access_level(allowed_actions: list[str]) -> AccessLevel:
     if has_write:
         return AccessLevel.WRITE
     return AccessLevel.READ
+
+
+# ---------------------------------------------------------------------------
+# Local policy evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def _action_matches(policy_action: str, target_action: str) -> bool:
+    """Case-insensitive action pattern matching.
+
+    Lowercases both the policy action pattern and target action, then uses
+    ``fnmatch.fnmatchcase()`` to match (e.g., ``secretsmanager:*`` matches
+    ``secretsmanager:GetSecretValue``).
+
+    Parameters
+    ----------
+    policy_action:
+        The action pattern from the IAM policy (may contain ``*`` or ``?``).
+    target_action:
+        The concrete action to test against the pattern.
+
+    Returns
+    -------
+    bool
+        ``True`` if the target action matches the policy action pattern.
+    """
+    return fnmatch.fnmatchcase(target_action.lower(), policy_action.lower())
+
+
+def _arn_matches(pattern: str, target: str) -> bool:
+    """Segment-by-segment ARN pattern matching.
+
+    Handles the ``"*"`` wildcard (matches any ARN), then splits both pattern
+    and target on ``":"`` into exactly 6 segments (using ``split(":", 5)``).
+    Each segment is compared using ``fnmatch.fnmatchcase()``.
+
+    Parameters
+    ----------
+    pattern:
+        The resource ARN pattern from the IAM policy.
+    target:
+        The concrete secret ARN to test against the pattern.
+
+    Returns
+    -------
+    bool
+        ``True`` if the target ARN matches the pattern.
+    """
+    if pattern == "*":
+        return True
+
+    pattern_parts = pattern.split(":", 5)
+    target_parts = target.split(":", 5)
+
+    if len(pattern_parts) != 6 or len(target_parts) != 6:
+        return False
+
+    return all(
+        fnmatch.fnmatchcase(t_seg, p_seg)
+        for p_seg, t_seg in zip(pattern_parts, target_parts)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Condition evaluation
+# ---------------------------------------------------------------------------
+
+_RESOURCE_TAG_PREFIXES = (
+    "secretsmanager:resourcetag/",
+    "aws:resourcetag/",
+)
+
+_SUPPORTED_CONDITION_OPERATORS: frozenset[str] = frozenset({
+    "StringEquals",
+    "StringEqualsIgnoreCase",
+    "StringLike",
+    "StringEqualsIfExists",
+    "StringLikeIfExists",
+})
+
+
+def _evaluate_condition(
+    condition_block: dict[str, dict[str, Any]],
+    secret_tags: dict[str, str],
+) -> bool:
+    """Evaluate a policy ``Condition`` block against the secret's tags.
+
+    Supports ``StringEquals``, ``StringEqualsIgnoreCase``, ``StringLike``,
+    and their ``IfExists`` variants.  Returns ``False`` (conservative deny)
+    for unsupported operators or non-tag condition keys.
+
+    AND semantics across operators and keys; OR semantics across values.
+
+    Parameters
+    ----------
+    condition_block:
+        The ``Condition`` dict from a policy statement, e.g.
+        ``{"StringEquals": {"secretsmanager:ResourceTag/env": "prod"}}``.
+    secret_tags:
+        The secret's tag map (key → value).
+
+    Returns
+    -------
+    bool
+        ``True`` if the condition is satisfied, ``False`` otherwise.
+    """
+    for operator, keys_map in condition_block.items():
+        if operator not in _SUPPORTED_CONDITION_OPERATORS:
+            return False
+
+        for condition_key, condition_values in keys_map.items():
+            # Check if the key is a resource tag key (case-insensitive)
+            key_lower = condition_key.lower()
+            tag_name: str | None = None
+            for prefix in _RESOURCE_TAG_PREFIXES:
+                if key_lower.startswith(prefix):
+                    tag_name = condition_key[len(prefix):]
+                    break
+
+            if tag_name is None:
+                # Non-tag condition key → conservative deny
+                return False
+
+            # Look up the tag value on the secret
+            tag_value: str | None = secret_tags.get(tag_name)
+            if tag_value is None:
+                # Missing tag key → condition not satisfied
+                return False
+
+            # Normalise condition_values to a list
+            if isinstance(condition_values, str):
+                condition_values = [condition_values]
+
+            # OR semantics across values
+            matched = False
+            base_operator = operator.replace("IfExists", "")
+            for cv in condition_values:
+                if base_operator == "StringEquals":
+                    if tag_value == cv:
+                        matched = True
+                        break
+                elif base_operator == "StringEqualsIgnoreCase":
+                    if tag_value.lower() == cv.lower():
+                        matched = True
+                        break
+                elif base_operator == "StringLike":
+                    if fnmatch.fnmatchcase(tag_value, cv):
+                        matched = True
+                        break
+
+            if not matched:
+                return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Statement evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def _statement_allowed_actions(
+    statement: dict[str, Any],
+    target_actions: list[str],
+    secret_arn: str,
+    secret_tags: dict[str, str],
+) -> list[str]:
+    """Return the subset of *target_actions* that *statement* allows.
+
+    Checks ``Effect=="Allow"``, matches actions via :func:`_action_matches`,
+    matches resources via :func:`_arn_matches`, and evaluates conditions via
+    :func:`_evaluate_condition`.
+
+    Parameters
+    ----------
+    statement:
+        A single IAM policy statement dict.
+    target_actions:
+        The concrete actions to test (e.g. ``DEFAULT_ACTIONS``).
+    secret_arn:
+        The target secret ARN.
+    secret_tags:
+        The secret's tag map (key → value).
+
+    Returns
+    -------
+    list[str]
+        Target actions that this statement allows.
+    """
+    if statement.get("Effect") != "Allow":
+        return []
+
+    raw_actions = statement.get("Action", [])
+    if isinstance(raw_actions, str):
+        raw_actions = [raw_actions]
+    matched_actions = [
+        ta for ta in target_actions
+        if any(_action_matches(pa, ta) for pa in raw_actions)
+    ]
+    if not matched_actions:
+        return []
+
+    raw_resources = statement.get("Resource", [])
+    if isinstance(raw_resources, str):
+        raw_resources = [raw_resources]
+    if not any(_arn_matches(rp, secret_arn) for rp in raw_resources):
+        return []
+
+    condition = statement.get("Condition")
+    if condition and not _evaluate_condition(condition, secret_tags):
+        return []
+
+    return matched_actions
+
+
+def _statement_denied_actions(
+    statement: dict[str, Any],
+    target_actions: list[str],
+    secret_arn: str,
+    secret_tags: dict[str, str],
+) -> list[str]:
+    """Return the subset of *target_actions* that *statement* explicitly denies.
+
+    Identical logic to :func:`_statement_allowed_actions` but checks
+    ``Effect=="Deny"`` instead.
+
+    Parameters
+    ----------
+    statement:
+        A single IAM policy statement dict.
+    target_actions:
+        The concrete actions to test (e.g. ``DEFAULT_ACTIONS``).
+    secret_arn:
+        The target secret ARN.
+    secret_tags:
+        The secret's tag map (key → value).
+
+    Returns
+    -------
+    list[str]
+        Target actions that this statement denies.
+    """
+    if statement.get("Effect") != "Deny":
+        return []
+
+    raw_actions = statement.get("Action", [])
+    if isinstance(raw_actions, str):
+        raw_actions = [raw_actions]
+    matched_actions = [
+        ta for ta in target_actions
+        if any(_action_matches(pa, ta) for pa in raw_actions)
+    ]
+    if not matched_actions:
+        return []
+
+    raw_resources = statement.get("Resource", [])
+    if isinstance(raw_resources, str):
+        raw_resources = [raw_resources]
+    if not any(_arn_matches(rp, secret_arn) for rp in raw_resources):
+        return []
+
+    condition = statement.get("Condition")
+    if condition and not _evaluate_condition(condition, secret_tags):
+        return []
+
+    return matched_actions
+
+
+# ---------------------------------------------------------------------------
+# Policy fetching
+# ---------------------------------------------------------------------------
+
+
+def _fetch_principal_policies(
+    iam_client: Any,
+    principal_arn: str,
+) -> list[dict[str, Any]]:
+    """Fetch all policy documents (inline + managed) for a principal.
+
+    Detects whether the principal is a role or user from the ARN, then
+    retrieves inline policies (``ListRolePolicies``/``GetRolePolicy`` or
+    ``ListUserPolicies``/``GetUserPolicy``) and managed policies
+    (``ListAttachedRolePolicies``/``ListAttachedUserPolicies`` →
+    ``GetPolicy`` → ``GetPolicyVersion`` using ``DefaultVersionId``).
+
+    Rate-limits with :data:`_BATCH_SLEEP` between IAM API calls.
+
+    **Security invariant**: this function NEVER calls ``GetSecretValue``.
+
+    Parameters
+    ----------
+    iam_client:
+        A boto3 IAM client (created with ``RETRY_CONFIG``).
+    principal_arn:
+        The IAM principal ARN to fetch policies for.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        A list of parsed policy document dicts.
+
+    Raises
+    ------
+    botocore.exceptions.ClientError
+        Re-raised for expired token errors so the caller can handle
+        truncation.  ``AccessDeniedException`` and ``NoSuchEntity`` are
+        caught and result in an empty list.
+    """
+    policies: list[dict[str, Any]] = []
+    name = principal_arn.rsplit("/", 1)[-1]
+    is_role = ":role/" in principal_arn
+
+    try:
+        if is_role:
+            inline_names = iam_client.list_role_policies(RoleName=name)["PolicyNames"]
+            for pname in inline_names:
+                time.sleep(_BATCH_SLEEP)
+                doc = iam_client.get_role_policy(RoleName=name, PolicyName=pname)[
+                    "PolicyDocument"
+                ]
+                policies.append(doc)
+
+            time.sleep(_BATCH_SLEEP)
+            attached = iam_client.list_attached_role_policies(RoleName=name)[
+                "AttachedPolicies"
+            ]
+            for ap in attached:
+                time.sleep(_BATCH_SLEEP)
+                version_id = iam_client.get_policy(PolicyArn=ap["PolicyArn"])[
+                    "Policy"
+                ]["DefaultVersionId"]
+                time.sleep(_BATCH_SLEEP)
+                doc = iam_client.get_policy_version(
+                    PolicyArn=ap["PolicyArn"], VersionId=version_id
+                )["PolicyVersion"]["Document"]
+                policies.append(doc)
+        else:
+            inline_names = iam_client.list_user_policies(UserName=name)["PolicyNames"]
+            for pname in inline_names:
+                time.sleep(_BATCH_SLEEP)
+                doc = iam_client.get_user_policy(UserName=name, PolicyName=pname)[
+                    "PolicyDocument"
+                ]
+                policies.append(doc)
+
+            time.sleep(_BATCH_SLEEP)
+            attached = iam_client.list_attached_user_policies(UserName=name)[
+                "AttachedPolicies"
+            ]
+            for ap in attached:
+                time.sleep(_BATCH_SLEEP)
+                version_id = iam_client.get_policy(PolicyArn=ap["PolicyArn"])[
+                    "Policy"
+                ]["DefaultVersionId"]
+                time.sleep(_BATCH_SLEEP)
+                doc = iam_client.get_policy_version(
+                    PolicyArn=ap["PolicyArn"], VersionId=version_id
+                )["PolicyVersion"]["Document"]
+                policies.append(doc)
+    except botocore.exceptions.ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code in ("NoSuchEntity", "AccessDeniedException", "AccessDenied"):
+            logger.warning(
+                "Cannot fetch policies for %s (%s) — skipping",
+                principal_arn, error_code,
+            )
+            return []
+        if is_expired_token_error(exc):
+            raise
+        logger.error(
+            "ClientError %s fetching policies for %s: %s",
+            error_code, principal_arn, exc,
+        )
+        raise
+
+    return policies
+
+
+# ---------------------------------------------------------------------------
+# Local policy evaluation (top-level orchestrator)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_policies_locally(
+    session: Session,
+    principal_arns: list[str],
+    secret_arn: str,
+    secret_tags: dict[str, str],
+    actions: list[str] | None = None,
+    skip_arns: frozenset[str] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> SimulationResult:
+    """Evaluate principal access by fetching and parsing IAM policies locally.
+
+    Supplements :func:`simulate_principal_access` for policies whose
+    ``Resource`` element contains wildcard ARN patterns or tag-based
+    conditions that the IAM Policy Simulator cannot evaluate.
+
+    **Security invariant**: this function NEVER calls ``GetSecretValue``.
+
+    Parameters
+    ----------
+    session:
+        A boto3 session for the production account.
+    principal_arns:
+        IAM principal ARNs to evaluate.
+    secret_arn:
+        The target secret ARN.
+    secret_tags:
+        The secret's tag map (key → value).
+    actions:
+        Secretsmanager actions to evaluate.  Defaults to
+        :data:`DEFAULT_ACTIONS`.
+    skip_arns:
+        Principal ARNs to skip (already found by the simulator).
+    progress:
+        Optional callback for progress messages.
+
+    Returns
+    -------
+    SimulationResult
+        Contains the list of principals with access, plus truncation metadata.
+    """
+    if actions is None:
+        actions = DEFAULT_ACTIONS
+
+    client = session.client("iam", config=RETRY_CONFIG)
+    results: list[PrincipalAccess] = []
+
+    candidates = [
+        arn for arn in principal_arns
+        if skip_arns is None or arn not in skip_arns
+    ]
+
+    logger.info(
+        "Local policy evaluation for %d principals against %s (skipping %d already found)",
+        len(candidates), secret_arn, len(principal_arns) - len(candidates),
+    )
+
+    total = len(candidates)
+    interval = 1 if total < 20 else 10
+
+    for idx, principal_arn in enumerate(candidates):
+        if progress is not None and idx > 0 and idx % interval == 0:
+            progress(f"Evaluating policies locally... ({idx}/{total})")
+
+        try:
+            policy_docs = _fetch_principal_policies(client, principal_arn)
+        except botocore.exceptions.ClientError as exc:
+            if is_expired_token_error(exc):
+                logger.warning(
+                    "Credentials expired during local evaluation at principal %d of %d",
+                    idx + 1, total,
+                )
+                return SimulationResult(
+                    principals=results, truncated=True,
+                    evaluated_count=idx, total_count=total,
+                )
+            raise
+
+        allowed: set[str] = set()
+        denied: set[str] = set()
+
+        for doc in policy_docs:
+            statements = doc.get("Statement", [])
+            if isinstance(statements, dict):
+                statements = [statements]
+            for stmt in statements:
+                allowed.update(
+                    _statement_allowed_actions(stmt, actions, secret_arn, secret_tags)
+                )
+                denied.update(
+                    _statement_denied_actions(stmt, actions, secret_arn, secret_tags)
+                )
+
+        final = list(allowed - denied)
+        if final:
+            results.append(
+                PrincipalAccess(
+                    principal_type=_principal_type_from_arn(principal_arn),
+                    principal_arn=principal_arn,
+                    principal_name=_principal_name_from_arn(principal_arn),
+                    access_level=derive_access_level(final),
+                    allowed_actions=final,
+                    policy_source="identity_policy",
+                )
+            )
+
+    logger.info(
+        "Local evaluation complete: %d of %d principals have access",
+        len(results), total,
+    )
+    return SimulationResult(
+        principals=results, truncated=False,
+        evaluated_count=total, total_count=total,
+    )

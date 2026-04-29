@@ -48,6 +48,8 @@ from secrets_audit.pipeline import AuditParams, ValidationError, validate_params
 from secrets_audit.renderer import render
 from secrets_audit.resolver import (
     SimulationResult,
+    derive_access_level,
+    evaluate_policies_locally,
     get_resource_policy_principals,
     inspect_context_keys,
     list_iam_roles,
@@ -320,12 +322,52 @@ def main(
     if progress:
         progress(f"Simulation complete: {len(identity_principals)} of {len(all_principal_arns)} principals have access")
 
-    # --- Step 5c: Inspect context keys for fully-denied principals ---
-    if sim_result.fully_denied_arns and not sim_result.truncated:
+    # --- Step 5c: Local policy evaluation for fully-denied principals ---
+    local_principals: list = []
+    if not sim_result.truncated and sim_result.fully_denied_arns:
+        sim_found_arns = frozenset(p.principal_arn for p in identity_principals)
         if progress:
-            progress(f"Inspecting context keys for {len(sim_result.fully_denied_arns)} fully-denied principal(s)...")
+            progress(
+                f"Evaluating policies locally for {len(sim_result.fully_denied_arns)} "
+                f"fully-denied principal(s)..."
+            )
+        local_result = evaluate_policies_locally(
+            prod_session,
+            sim_result.fully_denied_arns,
+            secret_meta.arn,
+            secret_tags=secret_meta.tags,
+            skip_arns=sim_found_arns,
+            progress=progress,
+        )
+        local_principals = local_result.principals
+
+        if local_result.truncated:
+            msg = (
+                f"WARNING: Credentials expired during local policy evaluation. "
+                f"Local evaluation is incomplete ({local_result.evaluated_count} of "
+                f"{local_result.total_count} principals evaluated)."
+            )
+            warnings.append(msg)
+            if progress:
+                progress(msg)
+
+        if progress:
+            progress(
+                f"Local evaluation complete: {len(local_principals)} additional "
+                f"principal(s) found"
+            )
+
+    # --- Step 5d: Inspect context keys for remaining fully-denied principals ---
+    local_found_arns = frozenset(p.principal_arn for p in local_principals)
+    remaining_denied = [
+        arn for arn in sim_result.fully_denied_arns
+        if arn not in local_found_arns
+    ]
+    if remaining_denied and not sim_result.truncated:
+        if progress:
+            progress(f"Inspecting context keys for {len(remaining_denied)} fully-denied principal(s)...")
         flagged_warnings, inspection_warnings = inspect_context_keys(
-            prod_session, sim_result.fully_denied_arns, progress=progress
+            prod_session, remaining_denied, progress=progress
         )
         warnings.extend(flagged_warnings)
         warnings.extend(inspection_warnings)
@@ -337,6 +379,19 @@ def main(
             principals_by_arn[p.principal_arn].policy_source = "both"
         else:
             principals_by_arn[p.principal_arn] = p
+
+    # Merge local evaluation results
+    for p in local_principals:
+        if p.principal_arn in principals_by_arn:
+            existing = principals_by_arn[p.principal_arn]
+            merged_actions = list(set(existing.allowed_actions) | set(p.allowed_actions))
+            existing.allowed_actions = merged_actions
+            existing.access_level = derive_access_level(merged_actions)
+            if existing.policy_source == "resource_policy":
+                existing.policy_source = "both"
+        else:
+            principals_by_arn[p.principal_arn] = p
+
     principals = list(principals_by_arn.values())
 
     # --- Step 6: Classify each principal ---

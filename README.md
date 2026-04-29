@@ -34,7 +34,7 @@ The tool runs a 10-step pipeline:
 2. **Create AWS session** — uses your current credentials (no long-lived keys)
 3. **Identify the operator** — records who ran the audit via `sts:GetCallerIdentity`
 4. **Resolve secret metadata** — calls `DescribeSecret` (never `GetSecretValue`)
-5. **Enumerate principals** — Lists all IAM roles and users. Simulates access for each principal using the IAM Policy Simulator with `GetSecretValue`, `PutSecretValue`, `UpdateSecret`, `DeleteSecret`, `CreateSecret`, and `DescribeSecret` actions, passing the secret's resource tags as context so tag-based policy conditions evaluate correctly. Parses the secret's resource-based policy for additional Allow grants. For principals the simulator fully denied with no matched statements, inspects their policy context keys via `GetContextKeysForPrincipalPolicy` and warns if they reference `secretsmanager:ResourceTag` conditions the simulator cannot evaluate.
+5. **Enumerate principals** — Lists all IAM roles and users. Simulates access for each principal using the IAM Policy Simulator with `GetSecretValue`, `PutSecretValue`, `UpdateSecret`, `DeleteSecret`, `CreateSecret`, and `DescribeSecret` actions, passing the secret's resource tags as context so tag-based policy conditions evaluate correctly. Parses the secret's resource-based policy for additional Allow grants. For principals the simulator fully denied with no matched statements, fetches their IAM policies and evaluates Action/Resource/Condition blocks locally to detect access the simulator cannot (e.g., `secretsmanager:ResourceTag` conditions). For any remaining unresolved principals, inspects their policy context keys via `GetContextKeysForPrincipalPolicy` and warns if they reference conditions the local evaluator couldn't handle.
 6. **Classify each principal** — inspects trust policies to categorize as Identity Center-managed, EKS service account, or plain IAM
 7. **Resolve Identity Center** — assumes a cross-account role into the management account to map permission sets → account assignments → users and groups
 8. **Enrich with CloudTrail** *(only when `--last-accessed` is provided)* — queries `LookupEvents` for `GetSecretValue` calls to show when each principal last accessed the secret
@@ -238,6 +238,14 @@ The operator's IAM identity needs these read-only permissions:
         "iam:GetRole",
         "iam:SimulatePrincipalPolicy",
         "iam:GetContextKeysForPrincipalPolicy",
+        "iam:ListRolePolicies",
+        "iam:GetRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListUserPolicies",
+        "iam:GetUserPolicy",
+        "iam:ListAttachedUserPolicies",
         "sts:GetCallerIdentity",
         "cloudtrail:LookupEvents"
       ],
@@ -247,7 +255,7 @@ The operator's IAM identity needs these read-only permissions:
 }
 ```
 
-> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to 5 requests per second. The tool handles this with adaptive retry and batching, but accounts with thousands of IAM roles will take longer. `iam:GetContextKeysForPrincipalPolicy` is only called for principals the simulator fully denied with no matched statements — it is not called for every principal.
+> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to 5 requests per second. The tool handles this with adaptive retry and batching, but accounts with thousands of IAM roles will take longer. `iam:GetContextKeysForPrincipalPolicy` and the policy-fetching permissions (`ListRolePolicies`, `GetRolePolicy`, etc.) are only called for principals the simulator fully denied with no matched statements — they are not called for every principal.
 
 ### Management account (for Identity Center resolution)
 
@@ -316,6 +324,7 @@ The tool is designed to produce the best report it can, even when some data sour
 | No principals have access | Outputs "No IAM principals have access to this secret" with full metadata header. |
 | Credentials expire mid-run | The tool produces a partial report with whatever data was collected before expiry. Warnings indicate which phase was interrupted and how many principals were evaluated. Use `--expiry-warning-minutes` to get an early warning before the simulation step. |
 | Context key inspection denied | When `GetContextKeysForPrincipalPolicy` is denied for a principal, the tool skips that principal and continues inspecting others. If denied for all principals (e.g., the operator role lacks the permission), the tool completes normally without limitation warnings — the rest of the report is unaffected. |
+| Policy fetching denied | When local policy evaluation cannot fetch policies for a principal (e.g., `ListRolePolicies` denied for AWS service-linked roles), the tool skips that principal and continues. A warning is logged but the report is unaffected. |
 
 ## Output Examples
 
@@ -477,7 +486,7 @@ tests/
 # Install with test dependencies
 pip install -e ".[test]"
 
-# Run all tests (305 tests: unit, property-based, and integration)
+# Run all tests (328 tests: unit, property-based, and integration)
 pytest
 
 # Run with coverage
@@ -494,7 +503,7 @@ pytest -k "hypothesis" -v
 
 | Limitation | Impact | Workaround |
 |---|---|---|
-| IAM Policy Simulator cannot evaluate service-specific condition keys | Policies using `secretsmanager:ResourceTag/<key>` (or other service-specific tag condition keys) in their `Condition` block will not be detected by the tool. The simulator silently treats these statements as non-matching. Policies using the global form `aws:ResourceTag/<key>` work correctly. See [IAM policy simulator documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html). | Rewrite policies to use `aws:ResourceTag/<key>` instead of `secretsmanager:ResourceTag/<key>`. Both resolve to the same underlying resource tags at enforcement time. |
+| IAM Policy Simulator cannot evaluate service-specific condition keys | Policies using `secretsmanager:ResourceTag/<key>` (or other service-specific tag condition keys) in their `Condition` block are not evaluated by the simulator. The tool compensates with local policy evaluation that fetches and parses the actual policy documents client-side, detecting access for `StringEquals`, `StringEqualsIgnoreCase`, `StringLike`, and their `IfExists` variants. For unsupported condition operators or non-tag condition keys, a warning is emitted instead. See [IAM policy simulator documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html). | No action needed for supported condition operators. For unsupported operators, rewrite policies to use `aws:ResourceTag/<key>` instead of `secretsmanager:ResourceTag/<key>`. |
 | IAM Policy Simulator rate limit | `SimulatePrincipalPolicy` is limited to ~5 requests per second. Accounts with thousands of IAM roles will take several minutes. | The tool uses adaptive retry and batching automatically. No user action needed. |
 
 ## FAQ
@@ -555,7 +564,7 @@ The web UI binds to localhost only and makes no network calls beyond AWS API end
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.6`.
+This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.7`.
 
 ## License
 
