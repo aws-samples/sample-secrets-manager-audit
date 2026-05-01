@@ -14,7 +14,7 @@ import fnmatch
 import json
 import logging
 import sys
-import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -24,6 +24,7 @@ from boto3 import Session
 from secrets_audit.aws_clients import RETRY_CONFIG, is_expired_token_error
 from secrets_audit.models import (
     AccessLevel,
+    AccountSnapshot,
     PrincipalAccess,
     PrincipalType,
     SecretMetadata,
@@ -61,8 +62,10 @@ DEFAULT_ACTIONS: list[str] = [
     "secretsmanager:DescribeSecret",
 ]
 
-# Batching: ~5 requests per second → sleep 0.2s between individual calls
-_BATCH_SLEEP: float = 0.2
+# Note: rate limiting is handled by boto3's adaptive retry config
+# (RETRY_CONFIG with max_attempts=5, mode=adaptive). No fixed sleep
+# is needed between calls.
+_BATCH_SLEEP: float = 0  # Retained for test compatibility; not used at runtime
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +348,13 @@ def simulate_principal_access(
     actions: list[str] | None = None,
     progress: Callable[[str], None] | None = None,
     resource_tags: dict[str, str] | None = None,
+    max_workers: int = 5,
 ) -> SimulationResult:
     """Evaluate which principals have Allow for secretsmanager actions on a secret.
 
-    Calls ``SimulatePrincipalPolicy`` one principal at a time with batching
-    (~5 req/sec) and relies on the adaptive retry config for throttling.
+    Calls ``SimulatePrincipalPolicy`` concurrently using a bounded thread
+    pool.  boto3 clients are thread-safe.  A shared abort flag stops
+    submission on credential expiry.
 
     Parameters
     ----------
@@ -362,20 +367,22 @@ def simulate_principal_access(
     actions:
         Secretsmanager actions to simulate.  Defaults to
         :data:`DEFAULT_ACTIONS`.
+    max_workers:
+        Maximum concurrent ``SimulatePrincipalPolicy`` calls.  Default 5.
 
     Returns
     -------
     SimulationResult
         Contains the list of principals with access, plus truncation metadata.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     if actions is None:
         actions = DEFAULT_ACTIONS
 
     context_entries = []
     for k, v in (resource_tags or {}).items():
-        # Pass both the global and service-specific tag condition keys.
-        # Policies may use either aws:ResourceTag/<key> or
-        # secretsmanager:ResourceTag/<key> — the simulator needs both.
         context_entries.append(
             {"ContextKeyName": f"aws:ResourceTag/{k}",
              "ContextKeyValues": [v], "ContextKeyType": "string"}
@@ -388,26 +395,22 @@ def simulate_principal_access(
     client = session.client("iam", config=RETRY_CONFIG)
     results: list[PrincipalAccess] = []
     fully_denied: list[str] = []
+    abort = threading.Event()
+    truncated_at: int | None = None
 
     logger.info(
-        "Simulating access for %d principals against %s",
-        len(principal_arns),
-        secret_arn,
+        "Simulating access for %d principals against %s (max_workers=%d)",
+        len(principal_arns), secret_arn, max_workers,
     )
 
     total = len(principal_arns)
-    interval = 1 if total < 20 else 10
 
-    for idx, principal_arn in enumerate(principal_arns):
-        if progress is not None and idx > 0 and idx % interval == 0:
-            progress(f"Simulating principals... ({idx}/{total})")
+    def _simulate_one(idx: int, principal_arn: str) -> tuple[int, str, dict | str | None]:
+        """Simulate one principal. Returns (idx, arn, response|'SKIP'|'EXPIRED'|None)."""
+        if abort.is_set():
+            return idx, principal_arn, None
 
-        logger.debug(
-            "SimulatePrincipalPolicy for %s (%d/%d)",
-            principal_arn,
-            idx + 1,
-            len(principal_arns),
-        )
+        logger.debug("SimulatePrincipalPolicy for %s (%d/%d)", principal_arn, idx + 1, total)
 
         try:
             response = client.simulate_principal_policy(
@@ -416,100 +419,102 @@ def simulate_principal_access(
                 ResourceArns=[secret_arn],
                 ContextEntries=context_entries,
             )
+            return idx, principal_arn, response
         except botocore.exceptions.ClientError as exc:
             error_code = exc.response["Error"]["Code"]
             if error_code == "AccessDeniedException":
-                logger.error(
-                    "Access denied simulating policy for %s — skipping",
-                    principal_arn,
-                )
-                continue
+                logger.error("Access denied simulating policy for %s — skipping", principal_arn)
+                return idx, principal_arn, "SKIP"
             if error_code == "NoSuchEntity":
-                logger.warning(
-                    "Principal %s no longer exists — skipping",
-                    principal_arn,
-                )
-                continue
+                logger.warning("Principal %s no longer exists — skipping", principal_arn)
+                return idx, principal_arn, "SKIP"
             if is_expired_token_error(exc):
-                logger.warning(
-                    "Credentials expired during simulation at principal %d of %d",
-                    idx + 1, total,
-                )
-                return SimulationResult(
-                    principals=results, truncated=True,
-                    evaluated_count=idx, total_count=total,
-                    fully_denied_arns=fully_denied,
-                )
-            # Let adaptive retry handle throttling; re-raise others
-            logger.error(
-                "ClientError %s simulating policy for %s: %s",
-                error_code,
-                principal_arn,
-                exc,
-            )
+                abort.set()
+                return idx, principal_arn, "EXPIRED"
+            logger.error("ClientError %s simulating policy for %s: %s", error_code, principal_arn, exc)
             raise
         except botocore.exceptions.BotoCoreError as exc:
-            logger.error(
-                "SDK error simulating policy for %s: %s", principal_arn, exc
-            )
+            logger.error("SDK error simulating policy for %s: %s", principal_arn, exc)
             raise
 
-        # Collect allowed actions from evaluation results
-        allowed: list[str] = []
-        for result in response.get("EvaluationResults", []):
-            action = result["EvalActionName"]
-            if result.get("EvalDecision") == "allowed":
-                allowed.append(action)
-                continue
-            # Check resource-specific results for scoped Resource policies
-            for rsr in result.get("ResourceSpecificResults", []):
-                if rsr.get("EvalResourceDecision") == "allowed":
-                    allowed.append(action)
-                    break
+    with ThreadPoolExecutor(max_workers=min(max_workers, total) if total > 0 else 1) as executor:
+        futures = {
+            executor.submit(_simulate_one, idx, arn): (idx, arn)
+            for idx, arn in enumerate(principal_arns)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            if progress is not None and completed % (1 if total < 20 else 10) == 0:
+                progress(f"Simulating principals... ({completed}/{total})")
 
-        # Track fully-denied principals: all actions must have implicitDeny
-        # with empty MatchedStatements and no allowed ResourceSpecificResults.
-        # Do NOT classify as fully denied if any action has explicitDeny,
-        # non-empty MatchedStatements, or any allowed decision.
-        if not allowed:
-            is_fully_denied = True
+            try:
+                idx, principal_arn, response = future.result()
+            except Exception:
+                raise
+
+            if response is None:
+                continue
+            if response == "SKIP":
+                continue
+            if response == "EXPIRED":
+                truncated_at = completed
+                logger.warning("Credentials expired during simulation at principal %d of %d", completed, total)
+                break
+
+            # Collect allowed actions from evaluation results
+            allowed: list[str] = []
             for result in response.get("EvaluationResults", []):
-                decision = result.get("EvalDecision")
-                matched = result.get("MatchedStatements", [])
-                if decision != "implicitDeny" or matched:
-                    is_fully_denied = False
-                    break
-                # Check ResourceSpecificResults for any allowed decision
+                action = result["EvalActionName"]
+                if result.get("EvalDecision") == "allowed":
+                    allowed.append(action)
+                    continue
                 for rsr in result.get("ResourceSpecificResults", []):
                     if rsr.get("EvalResourceDecision") == "allowed":
+                        allowed.append(action)
+                        break
+
+            # Track fully-denied principals
+            if not allowed:
+                is_fully_denied = True
+                for result in response.get("EvaluationResults", []):
+                    decision = result.get("EvalDecision")
+                    matched = result.get("MatchedStatements", [])
+                    if decision != "implicitDeny" or matched:
                         is_fully_denied = False
                         break
-                if not is_fully_denied:
-                    break
-            if is_fully_denied and response.get("EvaluationResults"):
-                fully_denied.append(principal_arn)
+                    for rsr in result.get("ResourceSpecificResults", []):
+                        if rsr.get("EvalResourceDecision") == "allowed":
+                            is_fully_denied = False
+                            break
+                    if not is_fully_denied:
+                        break
+                if is_fully_denied and response.get("EvaluationResults"):
+                    fully_denied.append(principal_arn)
 
-        if allowed:
-            access_level = derive_access_level(allowed)
-            results.append(
-                PrincipalAccess(
-                    principal_type=_principal_type_from_arn(principal_arn),
-                    principal_arn=principal_arn,
-                    principal_name=_principal_name_from_arn(principal_arn),
-                    access_level=access_level,
-                    allowed_actions=allowed,
-                    policy_source="identity_policy",
+            if allowed:
+                access_level = derive_access_level(allowed)
+                results.append(
+                    PrincipalAccess(
+                        principal_type=_principal_type_from_arn(principal_arn),
+                        principal_arn=principal_arn,
+                        principal_name=_principal_name_from_arn(principal_arn),
+                        access_level=access_level,
+                        allowed_actions=allowed,
+                        policy_source="identity_policy",
+                    )
                 )
-            )
 
-        # Rate-limit: sleep between calls to stay under ~5 req/sec
-        if idx < len(principal_arns) - 1:
-            time.sleep(_BATCH_SLEEP)
+    if truncated_at is not None:
+        return SimulationResult(
+            principals=results, truncated=True,
+            evaluated_count=truncated_at, total_count=total,
+            fully_denied_arns=fully_denied,
+        )
 
     logger.info(
         "Simulation complete: %d of %d principals have access",
-        len(results),
-        len(principal_arns),
+        len(results), len(principal_arns),
     )
     return SimulationResult(
         principals=results, truncated=False,
@@ -625,10 +630,6 @@ def inspect_context_keys(
                 f"conditions which the IAM Policy Simulator cannot evaluate. "
                 f"This principal may have access that is not reflected in this report."
             )
-
-        # Rate-limit: sleep between calls to stay under ~5 req/sec
-        if idx < total - 1:
-            time.sleep(_BATCH_SLEEP)
 
     logger.info(
         "Context key inspection complete: %d warning(s) flagged",
@@ -1087,6 +1088,188 @@ def _statement_denied_actions(
 
 
 # ---------------------------------------------------------------------------
+# Policy document decoding
+# ---------------------------------------------------------------------------
+
+
+def _decode_policy_document(doc: str | dict) -> dict | None:
+    """Decode a URL-encoded policy document string to a parsed dict.
+
+    This function NEVER calls GetSecretValue.
+
+    If *doc* is already a ``dict`` (boto3 may auto-parse in some cases),
+    it is returned unchanged.  If *doc* is a string, it is URL-decoded
+    with :func:`urllib.parse.unquote` and then parsed as JSON.
+
+    Parameters
+    ----------
+    doc:
+        A policy document — either a URL-encoded JSON string or an
+        already-parsed dict.
+
+    Returns
+    -------
+    dict | None
+        The parsed policy document, or ``None`` if JSON parsing fails.
+    """
+    if isinstance(doc, dict):
+        return doc
+    try:
+        return json.loads(urllib.parse.unquote(doc))
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Failed to decode policy document: %.100s", doc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GAAD snapshot loading
+# ---------------------------------------------------------------------------
+
+
+def load_account_snapshot(
+    session: Session,
+    progress: Callable[[str], None] | None = None,
+) -> AccountSnapshot | None:
+    """Load all IAM roles and users via ``GetAccountAuthorizationDetails``.
+
+    This function NEVER calls GetSecretValue.  It only calls
+    ``iam:GetAccountAuthorizationDetails`` to build an in-memory snapshot
+    of all IAM principals and their policy documents.
+
+    Parameters
+    ----------
+    session:
+        A boto3 session for the production account.
+    progress:
+        Optional callback for status messages.
+
+    Returns
+    -------
+    AccountSnapshot | None
+        A dict keyed by principal ARN, or ``None`` on failure (triggers
+        fallback to per-principal fetching).
+    """
+    client = session.client("iam", config=RETRY_CONFIG)
+    snapshot: AccountSnapshot = {}
+
+    # Managed policy ARN → decoded default version document
+    policy_index: dict[str, dict] = {}
+
+    logger.info("Loading account authorization details via GAAD")
+
+    try:
+        kwargs: dict[str, Any] = {
+            "Filter": ["Role", "User", "LocalManagedPolicy", "AWSManagedPolicy"],
+        }
+        page_num = 0
+
+        while True:
+            response = client.get_account_authorization_details(**kwargs)
+            page_num += 1
+
+            # Build managed policy index from Policies section
+            for policy_entry in response.get("Policies", []):
+                policy_arn = policy_entry.get("Arn", "")
+                for version in policy_entry.get("PolicyVersionList", []):
+                    if version.get("IsDefaultVersion"):
+                        decoded = _decode_policy_document(version.get("Document", {}))
+                        if decoded is not None:
+                            policy_index[policy_arn] = decoded
+                        break
+
+            # Process roles
+            for role in response.get("RoleDetailList", []):
+                arn = role["Arn"]
+
+                # Decode inline policies
+                inline_policies: list[dict[str, Any]] = []
+                for inline in role.get("RolePolicyList", []):
+                    decoded = _decode_policy_document(inline.get("PolicyDocument", {}))
+                    if decoded is not None:
+                        inline_policies.append(decoded)
+
+                # Resolve managed policies against index
+                managed_policies: list[dict[str, Any]] = []
+                for attached in role.get("AttachedManagedPolicies", []):
+                    mp_arn = attached.get("PolicyArn", "")
+                    if mp_arn in policy_index:
+                        managed_policies.append(policy_index[mp_arn])
+
+                # Decode trust policy
+                trust_doc = _decode_policy_document(
+                    role.get("AssumeRolePolicyDocument", {})
+                )
+
+                snapshot[arn] = {
+                    "inline_policies": inline_policies,
+                    "managed_policies": managed_policies,
+                    "trust_policy": trust_doc if trust_doc is not None else {},
+                    "path": role.get("Path", "/"),
+                }
+
+            # Process users
+            for user in response.get("UserDetailList", []):
+                arn = user["Arn"]
+
+                # Decode inline policies
+                inline_policies = []
+                for inline in user.get("UserPolicyList", []):
+                    decoded = _decode_policy_document(inline.get("PolicyDocument", {}))
+                    if decoded is not None:
+                        inline_policies.append(decoded)
+
+                # Resolve managed policies against index
+                managed_policies = []
+                for attached in user.get("AttachedManagedPolicies", []):
+                    mp_arn = attached.get("PolicyArn", "")
+                    if mp_arn in policy_index:
+                        managed_policies.append(policy_index[mp_arn])
+
+                snapshot[arn] = {
+                    "inline_policies": inline_policies,
+                    "managed_policies": managed_policies,
+                }
+
+            if progress:
+                progress(
+                    f"GAAD page {page_num}: {len(snapshot)} entities loaded"
+                )
+
+            # Pagination
+            if response.get("IsTruncated"):
+                kwargs["Marker"] = response["Marker"]
+            else:
+                break
+
+    except botocore.exceptions.ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if is_expired_token_error(exc):
+            raise
+        if error_code == "AccessDenied":
+            logger.warning(
+                "Access denied on GetAccountAuthorizationDetails — "
+                "falling back to per-principal fetching"
+            )
+            return None
+        logger.error(
+            "ClientError %s on GetAccountAuthorizationDetails: %s",
+            error_code, exc,
+        )
+        return None
+    except botocore.exceptions.BotoCoreError as exc:
+        logger.error(
+            "SDK error on GetAccountAuthorizationDetails: %s", exc
+        )
+        return None
+
+    logger.info(
+        "GAAD snapshot loaded: %d entities across %d page(s)",
+        len(snapshot), page_num,
+    )
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
 # Policy fetching
 # ---------------------------------------------------------------------------
 
@@ -1103,7 +1286,7 @@ def _fetch_principal_policies(
     (``ListAttachedRolePolicies``/``ListAttachedUserPolicies`` →
     ``GetPolicy`` → ``GetPolicyVersion`` using ``DefaultVersionId``).
 
-    Rate-limits with :data:`_BATCH_SLEEP` between IAM API calls.
+    Rate limiting is handled by boto3's adaptive retry config (``RETRY_CONFIG``).
 
     **Security invariant**: this function NEVER calls ``GetSecretValue``.
 
@@ -1134,22 +1317,18 @@ def _fetch_principal_policies(
         if is_role:
             inline_names = iam_client.list_role_policies(RoleName=name)["PolicyNames"]
             for pname in inline_names:
-                time.sleep(_BATCH_SLEEP)
                 doc = iam_client.get_role_policy(RoleName=name, PolicyName=pname)[
                     "PolicyDocument"
                 ]
                 policies.append(doc)
 
-            time.sleep(_BATCH_SLEEP)
             attached = iam_client.list_attached_role_policies(RoleName=name)[
                 "AttachedPolicies"
             ]
             for ap in attached:
-                time.sleep(_BATCH_SLEEP)
                 version_id = iam_client.get_policy(PolicyArn=ap["PolicyArn"])[
                     "Policy"
                 ]["DefaultVersionId"]
-                time.sleep(_BATCH_SLEEP)
                 doc = iam_client.get_policy_version(
                     PolicyArn=ap["PolicyArn"], VersionId=version_id
                 )["PolicyVersion"]["Document"]
@@ -1157,22 +1336,18 @@ def _fetch_principal_policies(
         else:
             inline_names = iam_client.list_user_policies(UserName=name)["PolicyNames"]
             for pname in inline_names:
-                time.sleep(_BATCH_SLEEP)
                 doc = iam_client.get_user_policy(UserName=name, PolicyName=pname)[
                     "PolicyDocument"
                 ]
                 policies.append(doc)
 
-            time.sleep(_BATCH_SLEEP)
             attached = iam_client.list_attached_user_policies(UserName=name)[
                 "AttachedPolicies"
             ]
             for ap in attached:
-                time.sleep(_BATCH_SLEEP)
                 version_id = iam_client.get_policy(PolicyArn=ap["PolicyArn"])[
                     "Policy"
                 ]["DefaultVersionId"]
-                time.sleep(_BATCH_SLEEP)
                 doc = iam_client.get_policy_version(
                     PolicyArn=ap["PolicyArn"], VersionId=version_id
                 )["PolicyVersion"]["Document"]
@@ -1209,6 +1384,7 @@ def evaluate_policies_locally(
     actions: list[str] | None = None,
     skip_arns: frozenset[str] | None = None,
     progress: Callable[[str], None] | None = None,
+    account_snapshot: AccountSnapshot | None = None,
 ) -> SimulationResult:
     """Evaluate principal access by fetching and parsing IAM policies locally.
 
@@ -1235,6 +1411,10 @@ def evaluate_policies_locally(
         Principal ARNs to skip (already found by the simulator).
     progress:
         Optional callback for progress messages.
+    account_snapshot:
+        Optional pre-loaded GAAD snapshot.  When provided, policy
+        documents are read from the snapshot instead of making
+        per-principal IAM API calls.
 
     Returns
     -------
@@ -1264,19 +1444,28 @@ def evaluate_policies_locally(
         if progress is not None and idx > 0 and idx % interval == 0:
             progress(f"Evaluating policies locally... ({idx}/{total})")
 
-        try:
-            policy_docs = _fetch_principal_policies(client, principal_arn)
-        except botocore.exceptions.ClientError as exc:
-            if is_expired_token_error(exc):
-                logger.warning(
-                    "Credentials expired during local evaluation at principal %d of %d",
-                    idx + 1, total,
-                )
-                return SimulationResult(
-                    principals=results, truncated=True,
-                    evaluated_count=idx, total_count=total,
-                )
-            raise
+        if account_snapshot is not None:
+            # Read policies from the pre-loaded GAAD snapshot
+            snap_entry = account_snapshot.get(principal_arn)
+            if snap_entry is None:
+                # Principal not in snapshot — treat as no policies, skip
+                continue
+            policy_docs = snap_entry.get("inline_policies", []) + snap_entry.get("managed_policies", [])
+        else:
+            # Existing behavior: fetch policies per principal via IAM API calls
+            try:
+                policy_docs = _fetch_principal_policies(client, principal_arn)
+            except botocore.exceptions.ClientError as exc:
+                if is_expired_token_error(exc):
+                    logger.warning(
+                        "Credentials expired during local evaluation at principal %d of %d",
+                        idx + 1, total,
+                    )
+                    return SimulationResult(
+                        principals=results, truncated=True,
+                        evaluated_count=idx, total_count=total,
+                    )
+                raise
 
         allowed: set[str] = set()
         denied: set[str] = set()

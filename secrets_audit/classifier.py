@@ -19,6 +19,7 @@ from boto3 import Session
 
 from secrets_audit.aws_clients import RETRY_CONFIG
 from secrets_audit.models import (
+    AccountSnapshot,
     PrincipalAccess,
     PrincipalClassification,
     PrincipalType,
@@ -43,7 +44,9 @@ _OIDC_PROVIDER_RE = re.compile(r"^arn:aws:iam::\d{12}:oidc-provider/.+")
 
 
 def classify_principal(
-    session: Session, principal: PrincipalAccess
+    session: Session,
+    principal: PrincipalAccess,
+    account_snapshot: AccountSnapshot | None = None,
 ) -> PrincipalAccess:
     """Inspect the principal's trust policy and classify it.
 
@@ -58,8 +61,14 @@ def classify_principal(
        principal.
     3. **PLAIN_IAM** — default.
 
+    When *account_snapshot* is provided, the trust policy and path are
+    read from the snapshot instead of calling ``GetRole``.
+
     On ``GetRole`` failure the principal is left as ``PLAIN_IAM`` with a
     warning logged.
+
+    **Security invariant**: this module only calls ``iam:GetRole`` (a read-only
+    API).  It never modifies IAM policies or role configurations.
 
     Parameters
     ----------
@@ -67,6 +76,9 @@ def classify_principal(
         A boto3 session for the production account.
     principal:
         The :class:`PrincipalAccess` to classify.  Mutated in place.
+    account_snapshot:
+        Optional pre-loaded GAAD snapshot.  When provided, trust policy
+        and path are read from the snapshot instead of calling ``GetRole``.
 
     Returns
     -------
@@ -79,15 +91,25 @@ def classify_principal(
         principal.classification = PrincipalClassification.PLAIN_IAM
         return principal
 
-    # Fetch the role's trust policy via GetRole
-    trust_policy, role_path = _get_role_trust_policy(
-        session, principal.principal_name
-    )
+    if account_snapshot is not None:
+        # Read trust policy and path from the pre-loaded GAAD snapshot
+        snap_entry = account_snapshot.get(principal.principal_arn)
+        if snap_entry is None:
+            # Role not in snapshot — default to PLAIN_IAM
+            principal.classification = PrincipalClassification.PLAIN_IAM
+            return principal
+        trust_policy = snap_entry.get("trust_policy", {})
+        role_path = snap_entry.get("path", "/")
+    else:
+        # Existing behavior: fetch the role's trust policy via GetRole
+        trust_policy, role_path = _get_role_trust_policy(
+            session, principal.principal_name
+        )
 
-    if trust_policy is None:
-        # GetRole failed — default to PLAIN_IAM (warning already logged)
-        principal.classification = PrincipalClassification.PLAIN_IAM
-        return principal
+        if trust_policy is None:
+            # GetRole failed — default to PLAIN_IAM (warning already logged)
+            principal.classification = PrincipalClassification.PLAIN_IAM
+            return principal
 
     role_name = principal.principal_name
 

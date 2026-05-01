@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Any, TypedDict
 
 
 # --- Enums ---
@@ -145,3 +146,23 @@ class AuditReport:
     principals: list[PrincipalAccess] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     versions: list[SecretVersionInfo] = field(default_factory=list)
+
+
+# --- GAAD Snapshot Types ---
+
+
+class PrincipalSnapshot(TypedDict, total=False):
+    """Pre-fetched policy data for a single IAM principal.
+
+    Populated from ``GetAccountAuthorizationDetails`` (GAAD).
+    ``inline_policies`` and ``managed_policies`` are always present (may be
+    empty lists).  ``trust_policy`` and ``path`` are present only for roles.
+    """
+
+    inline_policies: list[dict[str, Any]]
+    managed_policies: list[dict[str, Any]]
+    trust_policy: dict[str, Any]
+    path: str
+
+
+AccountSnapshot = dict[str, PrincipalSnapshot]

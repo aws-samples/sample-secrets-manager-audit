@@ -34,7 +34,7 @@ The tool runs a 10-step pipeline:
 2. **Create AWS session** — uses your current credentials (no long-lived keys)
 3. **Identify the operator** — records who ran the audit via `sts:GetCallerIdentity`
 4. **Resolve secret metadata** — calls `DescribeSecret` (never `GetSecretValue`)
-5. **Enumerate principals** — Lists all IAM roles and users. Simulates access for each principal using the IAM Policy Simulator with `GetSecretValue`, `PutSecretValue`, `UpdateSecret`, `DeleteSecret`, `CreateSecret`, and `DescribeSecret` actions, passing the secret's resource tags as context so tag-based policy conditions evaluate correctly. Parses the secret's resource-based policy for additional Allow grants. For principals the simulator fully denied with no matched statements, fetches their IAM policies and evaluates Action/Resource/Condition blocks locally to detect access the simulator cannot (e.g., `secretsmanager:ResourceTag` conditions). For any remaining unresolved principals, inspects their policy context keys via `GetContextKeysForPrincipalPolicy` and warns if they reference conditions the local evaluator couldn't handle.
+5. **Enumerate principals** — Lists all IAM roles and users. Loads all IAM policy data in bulk via `GetAccountAuthorizationDetails` (one paginated call instead of per-principal API fan-out). Simulates access for each principal using the IAM Policy Simulator with `GetSecretValue`, `PutSecretValue`, `UpdateSecret`, `DeleteSecret`, `CreateSecret`, and `DescribeSecret` actions, passing the secret's resource tags as context so tag-based policy conditions evaluate correctly. Parses the secret's resource-based policy for additional Allow grants. For principals the simulator fully denied with no matched statements, evaluates their pre-loaded IAM policies locally to detect access the simulator cannot (e.g., `secretsmanager:ResourceTag` conditions). For any remaining unresolved principals, inspects their policy context keys via `GetContextKeysForPrincipalPolicy` and warns if they reference conditions the local evaluator couldn't handle.
 6. **Classify each principal** — inspects trust policies to categorize as Identity Center-managed, EKS service account, or plain IAM
 7. **Resolve Identity Center** — assumes a cross-account role into the management account to map permission sets → account assignments → users and groups
 8. **Enrich with CloudTrail** *(only when `--last-accessed` is provided)* — queries `LookupEvents` for `GetSecretValue` calls to show when each principal last accessed the secret
@@ -211,6 +211,7 @@ secrets-audit --secret arn:aws:secretsmanager:us-east-1:111122223333:secret:rds/
 | `--ic-region` | No | — | AWS region for Identity Center API calls (e.g. `us-east-1`). Optional: the tool auto-detects the IC region by trying common regions when omitted. Only applies when cross-account flags are provided. |
 | `--output-file` | No | — | Write report to file instead of stdout |
 | `--expiry-warning-minutes` | No | `15` | Minutes before credential expiry to warn. Set to 0 to disable. If credentials are near expiry, a warning is emitted before the simulation step. If credentials expire mid-run, the tool produces a partial report instead of crashing. |
+| `--max-workers` | No | `5` | Maximum concurrent `SimulatePrincipalPolicy` calls. Higher values speed up large accounts but increase throttling pressure. The adaptive retry config handles throttling automatically. |
 
 For Identity Center resolution, use either `--master-profile` or the `--master-account-id` / `--cross-account-role-arn` pair, not both. If none are provided, the tool still reports all principals but cannot resolve IC role names to human users.
 
@@ -238,6 +239,7 @@ The operator's IAM identity needs these read-only permissions:
         "iam:GetRole",
         "iam:SimulatePrincipalPolicy",
         "iam:GetContextKeysForPrincipalPolicy",
+        "iam:GetAccountAuthorizationDetails",
         "iam:ListRolePolicies",
         "iam:GetRolePolicy",
         "iam:ListAttachedRolePolicies",
@@ -255,7 +257,7 @@ The operator's IAM identity needs these read-only permissions:
 }
 ```
 
-> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to 5 requests per second. The tool handles this with adaptive retry and batching, but accounts with thousands of IAM roles will take longer. `iam:GetContextKeysForPrincipalPolicy` and the policy-fetching permissions (`ListRolePolicies`, `GetRolePolicy`, etc.) are only called for principals the simulator fully denied with no matched statements — they are not called for every principal.
+> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to 5 requests per second. The tool handles this with adaptive retry and batching, but accounts with thousands of IAM roles will take longer. `iam:GetAccountAuthorizationDetails` loads all IAM policy data in a single paginated call, eliminating per-principal API fan-out. The remaining per-principal permissions (`ListRolePolicies`, `GetRolePolicy`, etc.) are retained as a fallback if `GetAccountAuthorizationDetails` is denied.
 
 ### Management account (for Identity Center resolution)
 
@@ -455,7 +457,7 @@ secrets_audit/
 
 ## Development
 
-> **Note:** The test suite (328 tests: unit, property-based, and integration) is maintained in a private development repository and is not included in this distribution.
+> **Note:** The test suite (358 tests: unit, property-based, and integration) is maintained in a private development repository and is not included in this distribution.
 
 ```bash
 # Install with test dependencies
@@ -487,7 +489,7 @@ pytest -k "hypothesis" -v
 No. The tool calls `DescribeSecret` and `GetResourcePolicy` only. It never calls `GetSecretValue`. The import doesn't even exist in the codebase. It only needs metadata, policies, and Identity Center assignments to build the access report.
 
 **Why does the report take so long on large accounts?**
-The primary bottleneck is the IAM Policy Simulator API (`SimulatePrincipalPolicy`), which is rate-limited to 5 requests per second. The tool evaluates every IAM role and user in the account individually, so an account with 500 roles will take about 2 minutes. The adaptive retry config and batching sleep handle throttling automatically. The tool shows progress messages on stderr (e.g. "Simulating principals... (42/347)") so you know it's working. Use `--quiet` to suppress these messages in scripts. CloudTrail enrichment (`--last-accessed`) is opt-in and queries events scoped to the target secret only, so it adds 3-10 seconds for most secrets.
+The primary bottleneck is the IAM Policy Simulator API (`SimulatePrincipalPolicy`), which is rate-limited to ~5 requests per second. The tool parallelizes these calls with a bounded thread pool (default 5 workers, tunable via `--max-workers`). An account with 600 roles completes simulation in about 30 seconds instead of 3 minutes. Identity Center resolution is also parallelized (4 concurrent workers). IAM policy data is loaded in bulk via `GetAccountAuthorizationDetails` (one paginated call instead of per-principal fan-out). Progress messages appear on stderr so you know the tool is working. Use `--quiet` to suppress them in scripts. CloudTrail enrichment (`--last-accessed`) is opt-in and adds 3-10 seconds for most secrets.
 
 **What happens if I don't have cross-account access to the management account?**
 If you provided cross-account flags (`--master-account-id`/`--cross-account-role-arn` or `--master-profile`) and the credentials are wrong, the tool exits immediately with a clear error before running the expensive IAM Policy Simulator step. The error message tells you what went wrong and suggests `--allow-partial` if you want a partial report anyway. With `--allow-partial`, the tool continues and produces a complete report of all principals with access levels and classifications, but IC-managed roles show the permission set name (e.g. `PS: ReadOnlyAccess`) instead of resolved user names. If you don't provide any cross-account flags at all, the tool runs normally without IC resolution.
@@ -539,7 +541,7 @@ The web UI binds to localhost only and makes no network calls beyond AWS API end
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.7`.
+This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.8`.
 
 ## License
 

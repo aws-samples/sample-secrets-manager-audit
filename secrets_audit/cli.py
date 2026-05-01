@@ -55,6 +55,7 @@ from secrets_audit.resolver import (
     list_iam_roles,
     list_iam_users,
     list_secret_versions,
+    load_account_snapshot,
     resolve_secret,
     simulate_principal_access,
 )
@@ -162,6 +163,12 @@ ProgressCallback = Callable[[str], None] | None
     type=int,
     help="Minutes before credential expiry to warn. 0 to disable. Default: 15.",
 )
+@click.option(
+    "--max-workers",
+    default=5,
+    type=int,
+    help="Maximum concurrent SimulatePrincipalPolicy calls. Default: 5.",
+)
 def main(
     secret: str,
     output_format: str,
@@ -177,6 +184,7 @@ def main(
     allow_partial: bool,
     ic_region: str | None,
     expiry_warning_minutes: int,
+    max_workers: int,
 ) -> None:
     """Resolve and report who can access an AWS Secrets Manager secret."""
     warnings: list[str] = []
@@ -263,6 +271,19 @@ def main(
     operator_arn = get_caller_identity(prod_session)
     logger.info("Operator identity: %s", operator_arn)
 
+    # --- Step 3b: Load GAAD snapshot ---
+    if progress:
+        progress("Loading account authorization details...")
+    account_snapshot = load_account_snapshot(prod_session, progress=progress)
+    if account_snapshot is None:
+        warnings.append(
+            "GAAD optimization unavailable — falling back to per-principal policy fetching."
+        )
+    elif progress:
+        role_count = sum(1 for v in account_snapshot.values() if "trust_policy" in v)
+        user_count = len(account_snapshot) - role_count
+        progress(f"Snapshot loaded: {role_count} roles, {user_count} users")
+
     # --- Step 4: Resolve secret metadata ---
     secret_meta = resolve_secret(prod_session, secret)
     logger.info("Resolved secret: %s (%s)", secret_meta.name, secret_meta.arn)  # nosemgrep: python.lang.security.audit.logging.python-logger-credential-disclosure
@@ -308,7 +329,7 @@ def main(
 
     sim_result = simulate_principal_access(
         prod_session, all_principal_arns, secret_meta.arn, progress=progress,
-        resource_tags=secret_meta.tags,
+        resource_tags=secret_meta.tags, max_workers=max_workers,
     )
     identity_principals = sim_result.principals
 
@@ -338,6 +359,7 @@ def main(
             secret_tags=secret_meta.tags,
             skip_arns=sim_found_arns,
             progress=progress,
+            account_snapshot=account_snapshot,
         )
         local_principals = local_result.principals
 
@@ -396,7 +418,7 @@ def main(
 
     # --- Step 6: Classify each principal ---
     for i, p in enumerate(principals):
-        principals[i] = classify_principal(prod_session, p)
+        principals[i] = classify_principal(prod_session, p, account_snapshot=account_snapshot)
 
     # --- Step 7: Identity Center resolution ---
     # cross_session was set in Step 2b (or remains None if no cross-account flags)
@@ -442,33 +464,59 @@ def main(
                 )
 
     if ic_instance_found:
-        for role_idx, (i, p) in enumerate(ic_roles):
-            if progress:
-                progress(f"Resolving Identity Center role {role_idx + 1} of {len(ic_roles)}...")
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            ps_name = extract_permission_set_name(p.principal_name)
+        abort = threading.Event()
 
+        def _resolve_one(role_idx: int, idx: int, principal: object) -> tuple[int, int, object | None]:
+            if abort.is_set():
+                return role_idx, idx, None
+            ps_name = extract_permission_set_name(principal.principal_name)
             try:
-                p.ic_resolution = resolve_identity_center(
+                resolution = resolve_identity_center(
                     cross_session, ps_name, target_account_id, expand_groups,
                     ic_region=effective_ic_region,
                     instance_arn=cached_instance_arn,
                     identity_store_id=cached_identity_store_id,
                 )
+                return role_idx, idx, resolution
             except botocore.exceptions.ClientError as exc:
                 if is_expired_token_error(exc):
-                    remaining_count = len(ic_roles) - role_idx
+                    abort.set()
+                    return role_idx, idx, "EXPIRED"
+                raise
+
+        with ThreadPoolExecutor(max_workers=min(4, len(ic_roles))) as executor:
+            futures = {
+                executor.submit(_resolve_one, role_idx, i, p): (role_idx, i, p)
+                for role_idx, (i, p) in enumerate(ic_roles)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                if progress:
+                    progress(f"Resolving Identity Center roles... ({completed}/{len(ic_roles)})")
+                role_idx, i, p = futures[future]
+                try:
+                    _, _, resolution = future.result()
+                except Exception:
+                    raise
+                if resolution == "EXPIRED":
+                    remaining_count = len(ic_roles) - completed
                     msg = f"WARNING: Credentials expired during Identity Center resolution. IC data is incomplete for {remaining_count} remaining role(s)."
                     warnings.append(msg)
                     if progress:
                         progress(msg)
-                    # Mark remaining roles as partial
-                    for remaining_idx in range(role_idx, len(ic_roles)):
-                        _, rp = ic_roles[remaining_idx]
-                        rp_ps_name = extract_permission_set_name(rp.principal_name)
-                        rp.ic_resolution = IdentityCenterResolution(permission_set_name=rp_ps_name, partial=True)
                     break
-                raise
+                elif resolution is not None:
+                    p.ic_resolution = resolution
+
+        # Mark any unresolved roles as partial (aborted or skipped)
+        for _, p in ic_roles:
+            if p.ic_resolution is None:
+                ps_name = extract_permission_set_name(p.principal_name)
+                p.ic_resolution = IdentityCenterResolution(permission_set_name=ps_name, partial=True)
     elif cross_session is None:
         # No cross-account session — partial resolution for all IC roles
         for role_idx, (i, p) in enumerate(ic_roles):
