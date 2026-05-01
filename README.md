@@ -257,7 +257,7 @@ The operator's IAM identity needs these read-only permissions:
 }
 ```
 
-> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to 5 requests per second. The tool handles this with adaptive retry and batching, but accounts with thousands of IAM roles will take longer. `iam:GetAccountAuthorizationDetails` loads all IAM policy data in a single paginated call, eliminating per-principal API fan-out. The remaining per-principal permissions (`ListRolePolicies`, `GetRolePolicy`, etc.) are retained as a fallback if `GetAccountAuthorizationDetails` is denied.
+> **Note:** `iam:SimulatePrincipalPolicy` is rate-limited to ~5 requests per second. The tool parallelizes these calls (default 5 workers, tunable via `--max-workers`) and uses adaptive retry for throttling. `iam:GetAccountAuthorizationDetails` loads all IAM policy data in a single paginated call, eliminating per-principal API fan-out. The remaining per-principal permissions (`ListRolePolicies`, `GetRolePolicy`, etc.) are retained as a fallback if `GetAccountAuthorizationDetails` is denied.
 
 ### Management account (for Identity Center resolution)
 
@@ -481,7 +481,7 @@ pytest -k "hypothesis" -v
 | Limitation | Impact | Workaround |
 |---|---|---|
 | IAM Policy Simulator cannot evaluate service-specific condition keys | Policies using `secretsmanager:ResourceTag/<key>` (or other service-specific tag condition keys) in their `Condition` block are not evaluated by the simulator. The tool compensates with local policy evaluation that fetches and parses the actual policy documents client-side, detecting access for `StringEquals`, `StringEqualsIgnoreCase`, `StringLike`, and their `IfExists` variants. For unsupported condition operators or non-tag condition keys, a warning is emitted instead. See [IAM policy simulator documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html). | No action needed for supported condition operators. For unsupported operators, rewrite policies to use `aws:ResourceTag/<key>` instead of `secretsmanager:ResourceTag/<key>`. |
-| IAM Policy Simulator rate limit | `SimulatePrincipalPolicy` is limited to ~5 requests per second. Accounts with thousands of IAM roles will take several minutes. | The tool uses adaptive retry and batching automatically. No user action needed. |
+| IAM Policy Simulator rate limit | `SimulatePrincipalPolicy` is limited to ~5 requests per second. The tool parallelizes calls (default 5 workers, tunable via `--max-workers`) and uses adaptive retry. An account with 600 roles completes in about 30 seconds. | Use `--max-workers` to tune concurrency for your account's rate limits. |
 
 ## FAQ
 
@@ -514,8 +514,8 @@ Use `--master-profile` if you already have a named profile in `~/.aws/config` fo
 **What if my Identity Center is in a different region than my profile default?**
 The tool auto-detects the IC region. It tries your session's default region first, then checks common IC deployment regions (us-east-1, us-west-2, eu-west-1, eu-central-1, ap-southeast-1) until it finds the instance. You don't need to know which region IC is in. If auto-detection is too slow or you want to skip the extra API calls, use `--ic-region us-east-1` (or whichever region your IC is in) to target it directly.
 
-**Why are some roles with tag-based policies missing from the report?**
-The IAM Policy Simulator cannot evaluate service-specific condition keys like `secretsmanager:ResourceTag/<key>`. If a role's policy uses `secretsmanager:ResourceTag/environment` in its `Condition` block, the simulator silently treats the entire statement as non-matching and returns `implicitDeny`, even when the secret has the correct tag. This is a [documented simulator limitation](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html), not a bug in the policy or the tool. The fix is to use `aws:ResourceTag/<key>` instead, which the simulator evaluates correctly and which resolves to the same underlying resource tags at enforcement time.
+**How does the tool handle `secretsmanager:ResourceTag` conditions?**
+The IAM Policy Simulator cannot evaluate service-specific condition keys like `secretsmanager:ResourceTag/<key>`. The tool compensates with local policy evaluation: it fetches the actual policy documents and evaluates Action, Resource, and Condition blocks client-side. This covers `StringEquals`, `StringEqualsIgnoreCase`, `StringLike`, and their `IfExists` variants. For condition operators the local evaluator doesn't support, a warning is emitted identifying the principal and recommending the use of `aws:ResourceTag/<key>` instead, which both the simulator and the local evaluator handle correctly. See [IAM policy simulator documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html) for background on the simulator limitation.
 
 ## Web UI
 
