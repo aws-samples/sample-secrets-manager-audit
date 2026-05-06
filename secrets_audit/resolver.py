@@ -568,8 +568,10 @@ def inspect_context_keys(
     total = len(principal_arns)
     logger.info("Inspecting context keys for %d fully-denied principal(s)", total)
 
+    interval = 1 if total < 20 else 10
+
     for idx, principal_arn in enumerate(principal_arns):
-        if progress is not None and idx > 0:
+        if progress is not None and idx > 0 and idx % interval == 0:
             progress(f"Inspecting context keys... ({idx}/{total})")
 
         logger.debug(
