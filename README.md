@@ -16,7 +16,7 @@ AWS Secrets Manager makes it easy to store secrets, but answering "who can actua
 ## Quick Start
 
 ```bash
-git clone git@ssh.gitlab.aws.dev:rayelkin/secrets-audit.git
+git clone https://github.com/aws-samples/sample-secrets-manager-audit.git
 cd secrets-audit
 pip install .
 secrets-audit --secret <your-secret-name-or-arn>
