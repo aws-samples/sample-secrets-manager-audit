@@ -345,6 +345,7 @@ def main(
 
     # --- Step 5c: Local policy evaluation for fully-denied principals ---
     local_principals: list = []
+    local_eval_complete = False
     if not sim_result.truncated and sim_result.fully_denied_arns:
         sim_found_arns = frozenset(p.principal_arn for p in identity_principals)
         if progress:
@@ -372,6 +373,8 @@ def main(
             warnings.append(msg)
             if progress:
                 progress(msg)
+        else:
+            local_eval_complete = True
 
         if progress:
             progress(
@@ -391,7 +394,12 @@ def main(
         flagged_warnings, inspection_warnings = inspect_context_keys(
             prod_session, remaining_denied, progress=progress
         )
-        warnings.extend(flagged_warnings)
+        # Suppress ResourceTag simulator-limitation warnings when local
+        # evaluation ran to completion — those tag-based policies have
+        # already been evaluated locally.  Surface them only when local
+        # evaluation was incomplete (e.g., credential expiry).
+        if not local_eval_complete:
+            warnings.extend(flagged_warnings)
         warnings.extend(inspection_warnings)
 
     # Merge: deduplicate by ARN, prefer identity_policy source
