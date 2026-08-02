@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75.0.0", "wheel>=0.45.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secrets-audit"
+version = "1.3.9"
+description = "Resolve and report who can access an AWS Secrets Manager secret"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "boto3==1.38.15",
+    "click==8.1.8",
+    "reportlab==4.4.10",
+]
+
+[project.optional-dependencies]
+web = [
+    "streamlit>=1.45.0",
+]
+test = [
+    "pytest==8.3.5",
+    "hypothesis==6.122.3",
+    "moto==5.1.3",
+    "pytest-cov==6.1.1",
+]
+
+[project.scripts]
+secrets-audit = "secrets_audit.cli:main"
+secrets-audit-web = "secrets_audit.web:launch"
+
+[tool.setuptools.packages.find]
+include = ["secrets_audit*"]
+
