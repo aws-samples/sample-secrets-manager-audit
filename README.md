@@ -16,7 +16,7 @@ AWS Secrets Manager makes it easy to store secrets, but answering "who can actua
 ## Quick Start
 
 ```bash
-git clone https://github.com/aws-samples/sample-secrets-manager-audit.git
+git clone git@ssh.gitlab.aws.dev:rayelkin/secrets-audit.git
 cd secrets-audit
 pip install .
 secrets-audit --secret <your-secret-name-or-arn>
@@ -541,7 +541,7 @@ The web UI binds to localhost only and makes no network calls beyond AWS API end
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.8`.
+This project follows [Semantic Versioning](https://semver.org/). The version is defined in `pyproject.toml` and `secrets_audit/__init__.py`. It appears in every report header as `Tool: secrets-audit v1.3.9`.
 
 ## License
 
