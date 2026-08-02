@@ -20,7 +20,7 @@ web = [
     "streamlit>=1.45.0",
 ]
 test = [
-    "pytest==8.3.5",
+    "pytest==9.0.3",
     "hypothesis==6.122.3",
     "moto==5.1.3",
     "pytest-cov==6.1.1",
