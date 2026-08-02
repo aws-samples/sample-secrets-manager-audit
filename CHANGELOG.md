@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.9] - 2026-08-02
+
+### Fixed
+- Suppressed stale `secretsmanager:ResourceTag` simulator-limitation warnings when local policy evaluation has completed successfully. These warnings ("Principal X has policies using secretsmanager:ResourceTag conditions which the IAM Policy Simulator cannot evaluate") are no longer emitted when the local evaluator has already resolved those tag-based policies. Warnings are still surfaced when local evaluation is incomplete (e.g., credential expiry mid-evaluation).
+
 ## [1.3.8] - 2026-04-30
 
 ### Added
